@@ -1,0 +1,8 @@
+# Thai Transcriber Dependencies
+# Python 3.11+ required
+
+# OpenAI SDK for API communication (Typhoon ASR is OpenAI-compatible)
+openai>=1.0.0
+
+# Optional: For better .env file handling (alternative to built-in parser)
+# python-dotenv>=1.0.0
