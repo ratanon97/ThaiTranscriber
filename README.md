@@ -24,12 +24,18 @@ git clone <repository-url>
 cd ThaiTranscriber
 ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment:
 ```bash
-pip3 install -r requirements.txt
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-3. Configure your API key:
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+4. Configure your API key:
 ```bash
 # Copy the example environment file
 cp .env.example .env
@@ -40,6 +46,16 @@ cp .env.example .env
 
 ## Usage
 
+**Important:** Always activate the virtual environment before running the script:
+```bash
+source venv/bin/activate
+```
+
+Or run directly with the venv Python:
+```bash
+./venv/bin/python transcribe.py --file audio.wav
+```
+
 ### Basic Transcription
 
 Transcribe an audio file to text:
@@ -47,7 +63,7 @@ Transcribe an audio file to text:
 python transcribe.py --file audio.wav
 ```
 
-This will create `audio.txt` in the same directory as your audio file.
+Transcription JSON output goes to `transcriptions/` and summaries to `summaries/`.
 
 ### JSON Output with Metadata
 
@@ -74,7 +90,7 @@ python transcribe.py --file audio.wav --output transcript.txt
 
 Save to a specific directory:
 ```bash
-python transcribe.py --file audio.wav --output-dir ./transcripts/
+python transcribe.py --file audio.wav --output-dir ./transcriptions/
 ```
 
 ### Advanced Options
@@ -126,12 +142,15 @@ python transcribe.py --help
 
 ```
 ThaiTranscriber/
-├── transcribe.py          # Main CLI entry point
+├── transcribe.py          # Main CLI entry point (requires venv)
 ├── src/
 │   ├── __init__.py       # Package initialization
 │   ├── client.py         # Typhoon ASR API client wrapper
 │   ├── config.py         # Configuration management
 │   └── utils.py          # Utility functions
+├── transcriptions/       # JSON transcription outputs (gitignored)
+├── summaries/            # Summary and translation documents (gitignored)
+├── venv/                 # Python virtual environment (gitignored)
 ├── requirements.txt      # Python dependencies
 ├── .env.example         # Environment configuration template
 ├── .gitignore           # Git ignore rules

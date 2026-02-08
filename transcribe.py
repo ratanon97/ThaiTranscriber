@@ -8,6 +8,31 @@ Usage:
 """
 
 import sys
+
+
+def _check_venv() -> None:
+    """Exit with a helpful message if not running inside a virtual environment."""
+    in_venv = (
+        hasattr(sys, "real_prefix")  # virtualenv
+        or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)  # venv
+    )
+    if not in_venv:
+        print(
+            "Error: This script must be run inside the project's virtual environment.\n"
+            "\n"
+            "Activate the venv first:\n"
+            "  source venv/bin/activate\n"
+            "  python transcribe.py --file audio.wav\n"
+            "\n"
+            "Or run directly with the venv Python:\n"
+            "  ./venv/bin/python transcribe.py --file audio.wav",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+_check_venv()
+
 import logging
 import argparse
 from pathlib import Path

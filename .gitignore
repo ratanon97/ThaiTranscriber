@@ -39,12 +39,6 @@ env/
 .DS_Store
 Thumbs.db
 
-# Output files
-*.txt
-*.json
-# Exception: don't ignore requirements.txt
-!requirements.txt
-
 # Audio files
 *.m4a
 *.wav
@@ -53,8 +47,9 @@ Thumbs.db
 *.ogg
 *.opus
 
-# Summary documents (generated outputs)
-*_Summary.md
+# Generated output directories
+transcriptions/
+summaries/
 
 # Logs
 *.log
