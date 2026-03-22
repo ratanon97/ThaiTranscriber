@@ -6,6 +6,8 @@ Provides a simple interface to the Typhoon ASR API using the OpenAI SDK.
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
+
+import httpx
 from openai import OpenAI
 from openai.types.audio import Transcription
 
@@ -28,6 +30,13 @@ class TyphoonASRClient:
         self.client = OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
+            max_retries=2,
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=120.0,   # Allow 2 min for ASR processing (avoids premature timeout before 524)
+                write=30.0,
+                pool=10.0,
+            ),
         )
 
         logger.info(f"Initialized Typhoon ASR client with model: {config.model}")

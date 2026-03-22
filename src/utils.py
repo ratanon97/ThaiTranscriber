@@ -12,8 +12,14 @@ from typing import Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 
-# Supported audio file formats by Typhoon ASR API
-SUPPORTED_AUDIO_FORMATS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
+# Formats the Typhoon ASR API accepts directly
+NATIVE_API_FORMATS = {".wav", ".mp3", ".flac", ".ogg", ".opus"}
+
+# Additional formats supported via ffmpeg conversion in pipeline mode
+CONVERTIBLE_FORMATS = {".m4a", ".aac", ".wma", ".webm", ".mp4", ".mkv"}
+
+# All supported input formats
+SUPPORTED_AUDIO_FORMATS = NATIVE_API_FORMATS | CONVERTIBLE_FORMATS
 
 
 def validate_audio_file(file_path: Path) -> bool:
@@ -39,7 +45,7 @@ def validate_audio_file(file_path: Path) -> bool:
     if file_suffix not in SUPPORTED_AUDIO_FORMATS:
         raise ValueError(
             f"Unsupported audio format: {file_suffix}. "
-            f"Supported formats: {', '.join(SUPPORTED_AUDIO_FORMATS)}"
+            f"Supported formats: {', '.join(sorted(SUPPORTED_AUDIO_FORMATS))}"
         )
 
     logger.info(f"Audio file validated: {file_path.name} ({file_suffix})")
