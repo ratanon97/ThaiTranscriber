@@ -90,8 +90,9 @@ Examples:
 
 Pipeline Mode:
   For files over 10 minutes or in m4a format, the tool automatically uses
-  a chunked pipeline: split -> transcribe each chunk -> merge results.
+  a chunked pipeline: split -> transcribe chunks in parallel -> merge results.
   Use --chunk-duration to control chunk size (default: 300s = 5 minutes).
+  Use --workers to control parallelism (default: 3, use 1 for sequential).
   Use --no-pipeline to force single-file mode.
 
 Environment Variables:
@@ -154,6 +155,14 @@ Get your API key from: https://playground.opentyphoon.ai/asr
         help="Force single-file transcription (skip chunked pipeline even for long files)",
     )
 
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of parallel transcription workers (default: 3, use 1 for sequential)",
+    )
+
     # Existing options
     parser.add_argument(
         "--env-file",
@@ -202,6 +211,7 @@ def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: Ty
     pipeline = TranscriptionPipeline(
         client=client,
         chunk_duration=chunk_duration,
+        max_workers=args.workers,
     )
 
     try:
@@ -281,6 +291,10 @@ def run_direct(args: argparse.Namespace, config: TranscriberConfig, client: Typh
 def main() -> int:
     """Main entry point for the transcriber CLI."""
     args = parse_arguments()
+
+    if args.workers < 1:
+        print("Error: --workers must be at least 1", file=sys.stderr)
+        return 1
 
     # Load environment variables from .env file
     load_env_file(args.env_file)

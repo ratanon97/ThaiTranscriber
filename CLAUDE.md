@@ -42,7 +42,7 @@ The tool now supports m4a directly via automatic pipeline mode. No manual ffmpeg
 For long recordings (1-2 hours), the pipeline automatically:
 1. Converts m4a to speech-optimized opus (mono, 16kHz, 48kbps)
 2. Splits into 5-minute chunks (configurable via `--chunk-duration`)
-3. Transcribes each chunk sequentially with retry and progress tracking
+3. Transcribes chunks in parallel (3 workers by default, configurable via `--workers`)
 4. Merges all results into a single JSON
 5. Cleans up temporary files
 
@@ -50,6 +50,12 @@ For long recordings (1-2 hours), the pipeline automatically:
 ```bash
 # Custom chunk size (e.g., 3 min for more reliability)
 ./venv/bin/python transcribe.py --file "meeting.m4a" --chunk-duration 180 --output-format json --output-dir ./transcriptions/
+
+# More parallel workers for faster processing (default: 3, safe up to 8)
+./venv/bin/python transcribe.py --file "meeting.m4a" --workers 5 --output-format json --output-dir ./transcriptions/
+
+# Sequential processing (like the old behavior)
+./venv/bin/python transcribe.py --file "meeting.m4a" --workers 1 --output-format json --output-dir ./transcriptions/
 
 # Resume an interrupted run (skips already-transcribed chunks)
 ./venv/bin/python transcribe.py --file "meeting.m4a" --output-format json --output-dir ./transcriptions/ --resume
@@ -115,7 +121,7 @@ Follow the established format in existing summaries. Example:
 - **Always use the venv**: `transcribe.py` enforces virtual environment usage and will refuse to run under system Python
 - **Never commit .env**: it contains the Typhoon API key
 - **m4a is now supported**: the pipeline auto-converts m4a to opus before transcription. No manual ffmpeg step needed.
-- **5-minute chunks are optimal**: for long files, the default 300s chunk duration balances API timeout risk (~35s processing per chunk) against number of API calls. Use 180s if experiencing frequent 524 timeouts.
+- **5-minute chunks are optimal**: for long files, the default 300s chunk duration balances API timeout risk (~35s processing per chunk) against number of API calls. Use 180s if experiencing frequent 524 timeouts. With 3 parallel workers (default), a 1-hour file processes in ~3-4 minutes instead of ~12 minutes sequential.
 - **Speaker attribution is approximate**: ASR output is a single text blob without speaker diarization. Claude infers speakers from context, names mentioned, and conversational patterns. Mark attribution as approximate.
 - **Thai ASR quality**: Typhoon ASR handles Thai well but informal speech, slang, and code-switching (Thai-English) can produce imperfect transcriptions. Claude should interpret the intent rather than translating ASR artifacts literally.
 - **File naming**: JSON files keep the original recording name. Summary MDs use underscored names with `_Summary.md` suffix.

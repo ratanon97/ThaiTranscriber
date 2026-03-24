@@ -1,13 +1,15 @@
 """Chunked transcription pipeline for long audio files.
 
-Orchestrates: split -> sequential transcribe -> merge
+Orchestrates: split -> parallel transcribe -> merge
 with progress tracking, retry logic, and resume capability.
 """
 
 import json
 import logging
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -67,6 +69,69 @@ def transcribe_with_retry(
     raise last_error
 
 
+def _cache_result(work_dir: Path, index: int, result: dict) -> None:
+    """Write result to cache with atomic rename to prevent corruption."""
+    cache_path = work_dir / f"result_{index:03d}.json"
+    tmp_path = cache_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    tmp_path.rename(cache_path)
+
+
+class _ProgressTracker:
+    """Thread-safe progress tracker for parallel chunk transcription."""
+
+    def __init__(self, total: int, cached: int, chunk_duration: int, quiet: bool):
+        self._lock = threading.Lock()
+        self.total = total
+        self.cached = cached
+        self.to_process = total - cached
+        self.completed = 0
+        self.start_time = time.time()
+        self.chunk_duration = chunk_duration
+        self.quiet = quiet
+
+    def report_cached(self, index: int) -> None:
+        if self.quiet:
+            return
+        with self._lock:
+            print(f"  [{index + 1:>3}/{self.total}] {self._time_range(index)} -- cached (skipped)")
+
+    def report_done(self, index: int, chunk_time: float, chars: int) -> None:
+        with self._lock:
+            self.completed += 1
+            if self.quiet:
+                return
+            elapsed = time.time() - self.start_time
+            if self.completed > 0 and self.completed < self.to_process:
+                avg = elapsed / self.completed
+                remaining = avg * (self.to_process - self.completed)
+                eta_str = f"ETA {format_duration(remaining)}"
+            elif self.completed >= self.to_process:
+                eta_str = "done"
+            else:
+                eta_str = "estimating..."
+            print(
+                f"  [{self.completed:>3}/{self.to_process}] "
+                f"{self._time_range(index)} "
+                f"done ({chunk_time:.1f}s, {chars:,} chars) [{eta_str}]"
+            )
+
+    def _time_range(self, index: int) -> str:
+        start = index * self.chunk_duration
+        end = (index + 1) * self.chunk_duration
+        return f"{self._fmt(start)}-{self._fmt(end)}"
+
+    @staticmethod
+    def _fmt(seconds: int) -> str:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        s = seconds % 60
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+
 class TranscriptionPipeline:
     """Orchestrates chunked transcription of long audio files.
 
@@ -82,21 +147,21 @@ class TranscriptionPipeline:
         self,
         client: TyphoonASRClient,
         chunk_duration: int = 300,
-        inter_request_delay: float = 2.0,
         max_retries: int = 3,
+        max_workers: int = 3,
     ):
         """Initialize the pipeline.
 
         Args:
             client: Typhoon ASR client instance
             chunk_duration: Seconds per chunk (default: 300 = 5 min)
-            inter_request_delay: Pause between API calls in seconds
             max_retries: Max retries per chunk on failure
+            max_workers: Number of parallel transcription workers (default: 3)
         """
         self.client = client
         self.chunk_duration = chunk_duration
-        self.inter_request_delay = inter_request_delay
         self.max_retries = max_retries
+        self.max_workers = max_workers
 
     def run(
         self,
@@ -151,8 +216,11 @@ class TranscriptionPipeline:
             # Step 1: Split audio into chunks
             chunks = self._split(input_path, work_dir, quiet)
 
-            # Step 2: Transcribe each chunk sequentially
-            results = self._transcribe_chunks(chunks, work_dir, resume, quiet, transcribe_kwargs)
+            # Step 2: Transcribe chunks (parallel or sequential)
+            if self.max_workers > 1:
+                results = self._transcribe_chunks_parallel(chunks, work_dir, resume, quiet, transcribe_kwargs)
+            else:
+                results = self._transcribe_chunks_sequential(chunks, work_dir, resume, quiet, transcribe_kwargs)
 
             # Step 3: Merge results
             merged = self._merge_results(results, input_path, duration)
@@ -203,7 +271,7 @@ class TranscriptionPipeline:
 
         return chunks
 
-    def _transcribe_chunks(
+    def _transcribe_chunks_parallel(
         self,
         chunks: List[Path],
         work_dir: Path,
@@ -211,7 +279,116 @@ class TranscriptionPipeline:
         quiet: bool,
         transcribe_kwargs: dict,
     ) -> List[Dict[str, Any]]:
-        """Transcribe all chunks sequentially with progress tracking."""
+        """Transcribe all chunks in parallel with progress tracking."""
+        total = len(chunks)
+        results = [None] * total
+        chunks_to_process = []
+        cached_count = 0
+
+        # Phase 1: Load cached results
+        for i, chunk in enumerate(chunks):
+            cache_path = work_dir / f"result_{i:03d}.json"
+            if resume and cache_path.exists():
+                with open(cache_path, encoding="utf-8") as f:
+                    results[i] = json.load(f)
+                cached_count += 1
+
+        progress = _ProgressTracker(total, cached_count, self.chunk_duration, quiet)
+
+        # Report cached chunks
+        for i in range(total):
+            if results[i] is not None:
+                progress.report_cached(i)
+            else:
+                chunks_to_process.append((i, chunks[i]))
+
+        if not chunks_to_process:
+            if not quiet:
+                print(f"\nAll {total} chunks already cached.")
+            return results
+
+        if not quiet:
+            workers_str = f"{self.max_workers} workers" if self.max_workers > 1 else "1 worker"
+            print(f"\nTranscribing {len(chunks_to_process)} chunks ({workers_str}):\n")
+
+        start_time = time.time()
+        chunk_times = []  # Track individual chunk times for speedup estimate
+        chunk_times_lock = threading.Lock()
+        cancel_event = threading.Event()
+
+        # Per-thread clients to avoid sharing httpx connection pool across threads
+        _thread_local = threading.local()
+
+        def _get_thread_client() -> TyphoonASRClient:
+            if not hasattr(_thread_local, "client"):
+                _thread_local.client = TyphoonASRClient(self.client.config)
+            return _thread_local.client
+
+        # Phase 2: Transcribe remaining chunks in parallel
+        def _process_chunk(index: int, chunk_path: Path) -> tuple:
+            if cancel_event.is_set():
+                raise RuntimeError("Cancelled")
+            chunk_start = time.time()
+            client = _get_thread_client()
+            result = transcribe_with_retry(
+                client,
+                chunk_path,
+                max_retries=self.max_retries,
+                **transcribe_kwargs,
+            )
+            _cache_result(work_dir, index, result)
+            chunk_time = time.time() - chunk_start
+            with chunk_times_lock:
+                chunk_times.append(chunk_time)
+            chars = len(result.get("text", ""))
+            progress.report_done(index, chunk_time, chars)
+            return index, result
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_index = {}
+            for index, chunk_path in chunks_to_process:
+                future = executor.submit(_process_chunk, index, chunk_path)
+                future_to_index[future] = index
+
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    idx, result = future.result()
+                    results[idx] = result
+                except Exception as e:
+                    # Signal other workers to stop, cancel queued futures
+                    cancel_event.set()
+                    for f in future_to_index:
+                        f.cancel()
+                    raise RuntimeError(
+                        f"Chunk {index:03d} failed after retries: {e}. "
+                        f"Run with --resume to retry failed chunks."
+                    ) from e
+
+        total_time = time.time() - start_time
+        if not quiet:
+            processed = len(chunks_to_process)
+            print(f"\nCompleted {processed} chunks in {format_duration(total_time)}", end="")
+            if cached_count > 0:
+                print(f" ({cached_count} cached)", end="")
+            if self.max_workers > 1 and chunk_times:
+                seq_estimate = sum(chunk_times)
+                if seq_estimate > total_time * 1.2:
+                    speedup = seq_estimate / total_time
+                    print(f" (~{speedup:.1f}x vs sequential)", end="")
+            print()
+
+        return results
+
+    def _transcribe_chunks_sequential(
+        self,
+        chunks: List[Path],
+        work_dir: Path,
+        resume: bool,
+        quiet: bool,
+        transcribe_kwargs: dict,
+    ) -> List[Dict[str, Any]]:
+        """Transcribe all chunks sequentially with progress tracking (fallback)."""
         total = len(chunks)
         results = []
         start_time = time.time()
@@ -232,8 +409,8 @@ class TranscriptionPipeline:
                 continue
 
             # Inter-request delay (skip for first non-cached chunk)
-            if i > 0 and self.inter_request_delay > 0 and (i - skipped) > 0:
-                time.sleep(self.inter_request_delay)
+            if i > 0 and (i - skipped) > 0:
+                time.sleep(2.0)
 
             # Progress display
             elapsed = time.time() - start_time
@@ -258,9 +435,8 @@ class TranscriptionPipeline:
                 **transcribe_kwargs,
             )
 
-            # Cache result immediately
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+            # Cache result
+            _cache_result(work_dir, i, result)
 
             results.append(result)
 
