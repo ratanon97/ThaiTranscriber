@@ -6,11 +6,11 @@ CLI tool that transcribes Thai audio (phone recordings, meetings, 1-2 hour conve
 
 1. Converts any input (m4a, mp3, wav, ...) to 16 kHz mono wav with ffmpeg
 2. Cuts it into ~5-minute chunks **at natural pauses**, not mid-word
-3. Transcribes chunks **in parallel** (6 workers) with retry on transient API errors
+3. Transcribes chunks **in parallel** (3 workers) with retry on transient API errors
 4. Passes each chunk through a Thai LLM (`typhoon-v2.5-30b`) with your **glossary** of names and terms to fix misheard words; raw text is kept alongside
 5. Merges everything into one JSON with **per-chunk timestamps**, plus an optional timestamped `.txt`
 
-A 1-hour recording takes roughly 2 minutes; a 2-hour recording roughly 4 minutes.
+Speed is set by the Typhoon ASR service, which processes requests one at a time per key at roughly 12x real time (a 5-minute chunk takes ~25 s of server time, and extra parallel requests only queue). Expect about 5 minutes for a 1-hour recording and 10 minutes for 2 hours; the correction pass overlaps with transcription and adds only ~20 s at the end.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ cp glossary.example.md glossary.md   # names, places, terms for correction (opti
 
 # Tuning
 --chunk-duration 180   # shorter chunks (default 300 s)
---workers 8            # more parallelism (API limit is 100 req/min; 8 is safe)
+--workers 2            # fewer parallel uploads if you see timeouts (default 3)
 --fixed-chunks         # cut at exact intervals instead of pauses
 --no-pipeline          # send a short API-compatible file directly
 --glossary path.md     # glossary other than ./glossary.md

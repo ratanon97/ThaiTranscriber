@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 AUTO_PIPELINE_THRESHOLD = 600  # 10 minutes
 
 DEFAULT_CHUNK_DURATION = 300
-DEFAULT_WORKERS = 6
+# Measured Aug 2026: one 5-min chunk alone ~27s; 4 concurrent uploads pushed one
+# past the 120s timeout. The ASR backend degrades under concurrency, so keep this low.
+DEFAULT_WORKERS = 3
 
 MANIFEST_NAME = "chunks.json"
 
@@ -147,11 +149,12 @@ class _Progress:
         avg = (time.time() - self.start_time) / self.completed
         return f"ETA {format_duration(avg * (self.to_process - self.completed))}"
 
-    def done(self, chunk: Chunk, seconds: float, chars: int) -> None:
+    def done(self, chunk: Chunk, asr_seconds: float, post_seconds: float, chars: int) -> None:
         with self._lock:
             self.completed += 1
             if not self.quiet:
-                print(f"  [{self.completed:>3}/{self.to_process}] {_span(chunk)} done ({seconds:.1f}s, {chars:,} chars) [{self._eta()}]")
+                timing = f"asr {asr_seconds:.1f}s" + (f" + fix {post_seconds:.1f}s" if post_seconds else "")
+                print(f"  [{self.completed:>3}/{self.to_process}] {_span(chunk)} done ({timing}, {chars:,} chars) [{self._eta()}]")
 
     def failed(self, chunk: Chunk, message: str) -> None:
         with self._lock:
@@ -372,35 +375,59 @@ class TranscriptionPipeline:
         thread_local = threading.local()
         start_time = time.time()
 
-        def worker(chunk: Chunk) -> Dict[str, Any]:
+        def asr_task(chunk: Chunk) -> "tuple[Dict[str, Any], float]":
             if not hasattr(thread_local, "client"):
                 thread_local.client = self.client_factory()
             t0 = time.time()
             result = transcribe_with_retry(
                 thread_local.client, chunk.path, max_retries=self.max_retries, **transcribe_kwargs
             )
-            if self.post_processor is not None:
-                result = self.post_processor(result, chunk)
+            return result, time.time() - t0
+
+        def finish(chunk: Chunk, result: Dict[str, Any], asr_seconds: float, post_seconds: float = 0.0) -> Dict[str, Any]:
             self._write_cache(work_dir, chunk.index, result)
-            progress.done(chunk, time.time() - t0, len(result.get("text") or ""))
+            progress.done(chunk, asr_seconds, post_seconds, len(result.get("text") or ""))
             return result
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        def post_task(chunk: Chunk, result: Dict[str, Any], asr_seconds: float) -> Dict[str, Any]:
+            t0 = time.time()
+            try:
+                result = self.post_processor(result, chunk)
+            except Exception as e:  # post-processing must never lose a transcribed chunk
+                logger.warning(f"Chunk {chunk.index:03d}: post-processing failed ({e}); keeping raw text")
+            return finish(chunk, result, asr_seconds, time.time() - t0)
+
+        # ASR uploads and LLM correction run in separate pools so a slow
+        # correction never holds up the next upload.
+        asr_pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        post_pool = ThreadPoolExecutor(max_workers=self.max_workers) if self.post_processor else None
         try:
-            futures = {executor.submit(worker, chunk): chunk for chunk in pending}
-            for future in as_completed(futures):
-                chunk = futures[future]
+            asr_futures = {asr_pool.submit(asr_task, chunk): chunk for chunk in pending}
+            post_futures = {}
+            for future in as_completed(asr_futures):
+                chunk = asr_futures[future]
                 try:
-                    results[chunk.index] = future.result()
+                    result, asr_seconds = future.result()
                 except Exception as e:
                     message = describe_error(e)
                     errors[chunk.index] = message
                     logger.error(f"Chunk {chunk.index:03d} ({_span(chunk)}) failed: {message}")
                     progress.failed(chunk, message)
+                    continue
+                if post_pool is not None:
+                    post_futures[post_pool.submit(post_task, chunk, result, asr_seconds)] = chunk
+                else:
+                    results[chunk.index] = finish(chunk, result, asr_seconds)
+            for future in as_completed(post_futures):
+                results[post_futures[future].index] = future.result()
         except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
+            asr_pool.shutdown(wait=False, cancel_futures=True)
+            if post_pool is not None:
+                post_pool.shutdown(wait=False, cancel_futures=True)
             raise
-        executor.shutdown(wait=True)
+        asr_pool.shutdown(wait=True)
+        if post_pool is not None:
+            post_pool.shutdown(wait=True)
 
         if not quiet:
             print(f"\nCompleted {len(pending) - len(errors)}/{len(pending)} chunks in {format_duration(time.time() - start_time)}")

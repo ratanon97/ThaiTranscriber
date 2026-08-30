@@ -38,7 +38,7 @@ When Tap provides an m4a audio recording, follow these steps:
 The pipeline activates automatically for m4a or files over 10 minutes. It:
 1. Converts to 16 kHz mono wav and detects pauses (one ffmpeg pass)
 2. Cuts into ~5-minute chunks at the nearest pause (`--chunk-duration` to change, `--fixed-chunks` to cut at exact times)
-3. Transcribes chunks in parallel (6 workers, `--workers` to change)
+3. Transcribes chunks with 3 in flight (`--workers`). The ASR service processes requests one at a time per key (~25 s per 5-min chunk), so more workers do not speed it up and 6+ cause timeouts
 4. Runs each chunk's text through `typhoon-v2.5-30b` with `glossary.md` to fix misheard names and words (`--no-correct` to skip)
 5. Merges into one JSON with `text` (corrected), `text_raw`, and `segments[]` with absolute timestamps
 6. Cleans up temporary files
@@ -105,6 +105,7 @@ Follow the established format in existing summaries. Example:
 - **Never commit .env or glossary.md**: `.env` contains the API key; `glossary.md` contains personal names. `glossary.example.md` is the committed template.
 - **Run the tests after changing src/**: `./venv/bin/python -m pytest -q` (ffmpeg-backed tests generate their own audio)
 - **Chunks are wav**: opus chunks were intermittently rejected by the API with 500s; wav has been reliable.
+- **Expected speed**: ~12x real time end to end (1 h recording ~5 min, 2 h ~10 min). Measured Aug 30, 2026: 2 concurrent uploads finished at 27 s and 47 s, 3 at 29/50/71 s, i.e. serialized server-side. Do not raise `--workers` to fix slowness; it only adds timeout risk.
 - **Chunk boundaries fall on pauses**: `plan_cut_points` in `src/audio.py` looks for a silence within 10% of the target length. Timestamps in `segments[]` come from the real chunk durations.
 - **Speaker attribution is approximate**: ASR output has no speaker diarization. Claude infers speakers from context, names mentioned, and conversational patterns. Mark attribution as approximate.
 - **Thai ASR quality**: the ASR model is small (~10% character error rate); the LLM pass fixes clear errors and names but not everything. Interpret intent rather than translating artifacts literally.

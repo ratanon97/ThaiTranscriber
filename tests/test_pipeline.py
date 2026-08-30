@@ -146,3 +146,18 @@ def test_pipeline_resplits_when_chunk_duration_changes(tone_with_pauses, tmp_pat
     chunks = p2._prepare_chunks(tone_with_pauses, work_dir, 12.0, resume=True, quiet=True)
     assert len(chunks) == 2
     assert not (work_dir / "result_000.json").exists(), "stale results from other chunking dropped"
+
+
+@requires_ffmpeg
+def test_pipeline_keeps_raw_text_when_post_processor_raises(tone_with_pauses, tmp_path):
+    client = FakeClient()
+
+    def post(result, chunk):
+        if chunk.index == 1:
+            raise RuntimeError("boom")
+        return {**result, "text": result["text"].upper()}
+
+    pipeline = TranscriptionPipeline(client, chunk_duration=5, post_processor=post, client_factory=lambda: client)
+    result = pipeline.run(tone_with_pauses, output_format="json", output_dir=tmp_path / "out", resume=False, quiet=True)
+    assert result["failed_chunks"] == []
+    assert result["text"] == "TEXT OF CHUNK_000 text of chunk_001 TEXT OF CHUNK_002"
