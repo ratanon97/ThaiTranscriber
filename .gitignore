@@ -53,3 +53,6 @@ summaries/
 
 # Logs
 *.log
+
+# Test / tool caches
+.pytest_cache/

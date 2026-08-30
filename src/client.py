@@ -1,46 +1,88 @@
 """Typhoon ASR API client wrapper.
 
-Provides a simple interface to the Typhoon ASR API using the OpenAI SDK.
+Thin layer over the OpenAI SDK (the Typhoon API is OpenAI-compatible) that
+turns responses into plain dicts and classifies errors for retry decisions.
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 import httpx
+import openai
 from openai import OpenAI
-from openai.types.audio import Transcription
 
 from .config import TranscriberConfig
 
-
 logger = logging.getLogger(__name__)
+
+# HTTP statuses worth retrying: timeouts, conflicts, rate limits, server errors
+RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+
+
+def build_openai_client(config: TranscriberConfig, read_timeout: float = 120.0) -> OpenAI:
+    """Create an OpenAI SDK client for the Typhoon API.
+
+    SDK-level retries are disabled: the pipeline owns retry policy so a bad
+    chunk fails fast instead of burning SDK retries times pipeline retries.
+    """
+    return OpenAI(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        max_retries=0,
+        timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=10.0),
+    )
+
+
+def is_retryable(error: Exception) -> bool:
+    """Whether an error is transient and worth retrying."""
+    if isinstance(error, openai.APIConnectionError):  # includes APITimeoutError
+        return True
+    if isinstance(error, openai.APIStatusError):
+        return error.status_code in RETRYABLE_STATUS_CODES
+    return False
+
+
+def describe_error(error: Exception) -> str:
+    """Short, actionable description of an API error for logs and output."""
+    if isinstance(error, openai.AuthenticationError):
+        return "authentication failed - check TYPHOON_API_KEY"
+    if isinstance(error, openai.RateLimitError):
+        return "rate limit exceeded (100 requests/minute)"
+    if isinstance(error, openai.APITimeoutError):
+        return "request timed out"
+    if isinstance(error, openai.APIConnectionError):
+        return "connection error"
+    if isinstance(error, openai.APIStatusError):
+        return f"HTTP {error.status_code}: {error.message}"
+    return f"{type(error).__name__}: {error}"
+
+
+def response_to_dict(response: Any) -> Dict[str, Any]:
+    """Normalize an SDK transcription response into a plain dict.
+
+    Keeps `text` plus any standard fields the server actually filled in.
+    Typhoon's non-standard `timestamps` blob is dropped: its times are
+    relative to internal streaming windows and cannot be mapped to positions
+    in the audio.
+    """
+    if isinstance(response, str):
+        return {"text": response}
+    data = response.model_dump() if hasattr(response, "model_dump") else {}
+    result: Dict[str, Any] = {"text": data.get("text") or getattr(response, "text", "") or ""}
+    for key in ("language", "duration", "segments", "words"):
+        if data.get(key) is not None:
+            result[key] = data[key]
+    return result
 
 
 class TyphoonASRClient:
-    """Client for interacting with Typhoon ASR API."""
+    """Client for the Typhoon ASR transcription endpoint."""
 
     def __init__(self, config: TranscriberConfig):
-        """Initialize the Typhoon ASR client.
-
-        Args:
-            config: Configuration object containing API settings
-        """
         self.config = config
-        self.client = OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            max_retries=2,
-            timeout=httpx.Timeout(
-                connect=10.0,
-                read=120.0,   # Allow 2 min for ASR processing (avoids premature timeout before 524)
-                write=30.0,
-                pool=10.0,
-            ),
-        )
-
-        logger.info(f"Initialized Typhoon ASR client with model: {config.model}")
-        logger.info(f"Base URL: {config.base_url}")
+        self.client = build_openai_client(config)
+        logger.info(f"Initialized Typhoon ASR client: model={config.model} base_url={config.base_url}")
 
     def transcribe(
         self,
@@ -49,132 +91,32 @@ class TyphoonASRClient:
         temperature: Optional[float] = None,
         response_format: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Transcribe an audio file using Typhoon ASR API.
+        """Transcribe one audio file.
 
         Args:
-            audio_file_path: Path to the audio file to transcribe
-            language: Language code (default: from config, typically 'th' for Thai)
-            temperature: Sampling temperature (default: from config, typically 0.0)
-            response_format: Response format - json, text, srt, verbose_json, vtt
-                           (default: from config)
+            audio_file_path: Path to the audio file
+            language: Language code (default: from config)
+            temperature: Sampling temperature (default: from config)
+            response_format: json, text, srt, verbose_json, vtt (default: from config)
 
         Returns:
-            Dictionary containing transcription results with keys:
-                - text: The transcribed text
-                - Additional fields depending on response_format (segments, words, etc.)
+            Dict with at least a `text` key
 
         Raises:
-            FileNotFoundError: If audio file doesn't exist
-            ValueError: If audio format is not supported
-            Exception: For API errors (authentication, rate limits, etc.)
+            FileNotFoundError: If the audio file does not exist
+            openai.APIError: For API failures (see is_retryable / describe_error)
         """
         if not audio_file_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
 
-        # Use config defaults if not overridden
-        language = language or self.config.language
-        temperature = temperature if temperature is not None else self.config.temperature
-        response_format = response_format or self.config.response_format
+        params: Dict[str, Any] = {
+            "model": self.config.model,
+            "language": language or self.config.language,
+            "temperature": temperature if temperature is not None else self.config.temperature,
+            "response_format": response_format or self.config.response_format,
+        }
+        logger.debug(f"Transcribing {audio_file_path.name} ({audio_file_path.stat().st_size / 1024:.0f} KB) {params}")
 
-        logger.info(f"Transcribing file: {audio_file_path}")
-        logger.info(f"File size: {audio_file_path.stat().st_size / 1024:.2f} KB")
-        logger.info(f"Language: {language}, Temperature: {temperature}, Format: {response_format}")
-
-        try:
-            with open(audio_file_path, "rb") as audio_file:
-                # Build parameters for the API call
-                params: Dict[str, Any] = {
-                    "model": self.config.model,
-                    "file": audio_file,
-                    "language": language,
-                    "temperature": temperature,
-                    "response_format": response_format,
-                }
-
-                # Add timestamp_granularities if using verbose_json format
-                if response_format == "verbose_json" and self.config.enable_timestamps:
-                    params["timestamp_granularities"] = ["word", "segment"]
-
-                logger.debug(f"API request parameters: {params}")
-
-                # Make the API call
-                response = self.client.audio.transcriptions.create(**params)
-
-                logger.info("Transcription successful")
-
-                # Convert response to dictionary
-                if isinstance(response, Transcription):
-                    result = {
-                        "text": response.text,
-                    }
-                    # Add additional fields if available
-                    if hasattr(response, "segments"):
-                        result["segments"] = response.segments
-                    if hasattr(response, "words"):
-                        result["words"] = response.words
-                    if hasattr(response, "language"):
-                        result["language"] = response.language
-                    if hasattr(response, "duration"):
-                        result["duration"] = response.duration
-
-                    return result
-                else:
-                    # For non-json responses (text, srt, vtt)
-                    return {"text": str(response)}
-
-        except FileNotFoundError:
-            logger.error(f"Audio file not found: {audio_file_path}")
-            raise
-        except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            self._handle_api_error(e)
-            raise
-
-    def _handle_api_error(self, error: Exception) -> None:
-        """Handle and log API errors with helpful messages.
-
-        Args:
-            error: The exception that occurred
-        """
-        error_msg = str(error).lower()
-
-        if "authentication" in error_msg or "unauthorized" in error_msg or "401" in error_msg:
-            logger.error(
-                "Authentication failed. Please check your TYPHOON_API_KEY. "
-                "Get your API key from https://playground.opentyphoon.ai/asr"
-            )
-        elif "rate limit" in error_msg or "429" in error_msg:
-            logger.error(
-                "Rate limit exceeded. The Typhoon ASR API allows 100 requests per minute. "
-                "Please wait before making more requests."
-            )
-        elif "timeout" in error_msg:
-            logger.error(
-                "Request timed out. This may be due to network issues or a large audio file. "
-                "Please check your connection and try again."
-            )
-        elif "invalid" in error_msg and "format" in error_msg:
-            logger.error(
-                "Invalid audio format. Supported formats: .wav, .mp3, .flac, .ogg, .opus"
-            )
-        elif "file size" in error_msg or "too large" in error_msg:
-            logger.error(
-                "Audio file is too large. Please check the API documentation for file size limits."
-            )
-        else:
-            logger.error(f"API error: {error}")
-
-    def health_check(self) -> bool:
-        """Check if the API is accessible and credentials are valid.
-
-        Returns:
-            True if API is accessible, False otherwise
-        """
-        try:
-            # Try to make a simple request to verify API access
-            # Note: This will fail if we don't have a valid audio file, but will validate auth
-            logger.info("Performing API health check...")
-            return True
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
+        with open(audio_file_path, "rb") as audio_file:
+            response = self.client.audio.transcriptions.create(file=audio_file, **params)
+        return response_to_dict(response)

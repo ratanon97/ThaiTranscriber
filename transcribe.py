@@ -2,18 +2,13 @@
 """Thai Transcriber - CLI tool for transcribing Thai audio using Typhoon ASR API.
 
 Usage:
-    # Short files (direct API call)
-    python transcribe.py --file audio.wav
-    python transcribe.py --file audio.mp3 --output-format json
-
-    # Long files / m4a (auto-pipeline with chunking)
+    # Any audio file; long files and m4a use the chunked pipeline automatically
     python transcribe.py --file meeting.m4a --output-format json --output-dir ./transcriptions/
 
-    # Explicit chunking control
-    python transcribe.py --file meeting.m4a --chunk-duration 300 --output-format json
+    # Resume an interrupted or partially failed run
+    python transcribe.py --file meeting.m4a --output-format json --output-dir ./transcriptions/ --resume
 
-    # Resume an interrupted pipeline run
-    python transcribe.py --file meeting.m4a --output-format json --resume
+Exit codes: 0 success, 1 error, 2 partial (some chunks failed; use --resume), 130 interrupted.
 """
 
 import sys
@@ -21,20 +16,13 @@ import sys
 
 def _check_venv() -> None:
     """Exit with a helpful message if not running inside a virtual environment."""
-    in_venv = (
-        hasattr(sys, "real_prefix")  # virtualenv
-        or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)  # venv
-    )
+    in_venv = hasattr(sys, "real_prefix") or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)
     if not in_venv:
         print(
             "Error: This script must be run inside the project's virtual environment.\n"
             "\n"
-            "Activate the venv first:\n"
-            "  source venv/bin/activate\n"
-            "  python transcribe.py --file audio.wav\n"
-            "\n"
-            "Or run directly with the venv Python:\n"
-            "  ./venv/bin/python transcribe.py --file audio.wav",
+            "Run it with the venv Python:\n"
+            "  ./venv/bin/python transcribe.py --file audio.m4a",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -42,180 +30,75 @@ def _check_venv() -> None:
 
 _check_venv()
 
-import logging
 import argparse
+import logging
+import os
 from pathlib import Path
-from typing import Optional
 
+from src.client import TyphoonASRClient, describe_error
 from src.config import TranscriberConfig, load_env_file
-from src.client import TyphoonASRClient
-from src.utils import (
-    validate_audio_file,
-    save_text_output,
-    save_json_output,
-    format_transcription_summary,
-    generate_output_path,
-    format_file_size,
-)
+from src.pipeline import DEFAULT_CHUNK_DURATION, DEFAULT_WORKERS, TranscriptionPipeline, should_use_pipeline
+from src.utils import format_file_size, format_transcription_summary, save_outputs, validate_audio_file
 
-
-def setup_logging(log_level: str = "INFO") -> None:
-    """Configure logging for the application."""
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+EXIT_OK, EXIT_ERROR, EXIT_PARTIAL, EXIT_INTERRUPTED = 0, 1, 2, 130
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Transcribe Thai audio files using Typhoon ASR API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic transcription (short files)
-  python transcribe.py --file audio.wav
-  python transcribe.py --file audio.mp3 --output-format json
+        epilog=f"""
+Pipeline mode:
+  Files over 10 minutes or in a format the API cannot take directly (m4a, ...)
+  are converted to 16 kHz wav, cut into ~{DEFAULT_CHUNK_DURATION}s chunks at natural pauses,
+  transcribed with {DEFAULT_WORKERS} parallel workers, and merged with per-chunk timestamps.
+  A chunk that keeps failing does not stop the others: the output is written
+  with that span marked missing, the exit code is 2, and --resume retries it.
 
-  # Long audio with automatic pipeline (m4a, wav, any format)
-  python transcribe.py --file "meeting.m4a" --output-format json --output-dir ./transcriptions/
-
-  # Custom chunk size (default: 300s = 5 min)
-  python transcribe.py --file "meeting.m4a" --chunk-duration 180 --output-format json
-
-  # Resume an interrupted run
-  python transcribe.py --file "meeting.m4a" --output-format json --resume
-
-Pipeline Mode:
-  For files over 10 minutes or in m4a format, the tool automatically uses
-  a chunked pipeline: split -> transcribe chunks in parallel -> merge results.
-  Use --chunk-duration to control chunk size (default: 300s = 5 minutes).
-  Use --workers to control parallelism (default: 3, use 1 for sequential).
-  Use --no-pipeline to force single-file mode.
-
-Environment Variables:
-  TYPHOON_API_KEY          Your Typhoon ASR API key (required)
+Environment variables (or .env):
+  TYPHOON_API_KEY          Your Typhoon API key (required)
   TYPHOON_BASE_URL         API base URL (optional)
-  TYPHOON_MODEL            Model name (optional)
-  TYPHOON_LANGUAGE         Language code (optional, default: th)
-  TYPHOON_RESPONSE_FORMAT  Response format (optional, default: json)
-  TYPHOON_TEMPERATURE      Temperature (optional, default: 0.0)
-  TYPHOON_LOG_LEVEL        Logging level (optional, default: INFO)
+  TYPHOON_MODEL            ASR model (default: typhoon-asr-realtime)
+  TYPHOON_LANGUAGE         Language code (default: th)
+  TYPHOON_RESPONSE_FORMAT  Response format (default: json)
+  TYPHOON_TEMPERATURE      Temperature (default: 0.0)
+  TYPHOON_LOG_LEVEL        Logging level (default: INFO)
 
 Get your API key from: https://playground.opentyphoon.ai/asr
         """,
     )
+    parser.add_argument("--file", "-f", type=Path, required=True, help="Audio file (.wav, .mp3, .flac, .ogg, .opus, .m4a, ...)")
+    parser.add_argument("--output", "-o", type=Path, help="Output file path (default: <output-dir>/<input stem>.<ext>)")
+    parser.add_argument("--output-format", "-of", choices=["txt", "json", "both"], default="txt", help="Output format (default: txt)")
+    parser.add_argument("--output-dir", "-od", type=Path, help="Output directory (default: same as input file)")
 
-    parser.add_argument(
-        "--file", "-f",
-        type=Path,
-        required=True,
-        help="Path to the audio file (.wav, .mp3, .flac, .ogg, .opus, .m4a)",
-    )
+    pipeline = parser.add_argument_group("pipeline options")
+    pipeline.add_argument("--chunk-duration", type=int, default=None, metavar="SECONDS", help=f"Target chunk length; forces pipeline mode (default: {DEFAULT_CHUNK_DURATION})")
+    pipeline.add_argument("--workers", "-w", type=int, default=DEFAULT_WORKERS, metavar="N", help=f"Parallel transcription workers (default: {DEFAULT_WORKERS})")
+    pipeline.add_argument("--resume", action="store_true", help="Reuse chunks and results from a previous interrupted/partial run")
+    pipeline.add_argument("--fixed-chunks", action="store_true", help="Cut at exact intervals instead of at nearby pauses")
+    pipeline.add_argument("--no-pipeline", action="store_true", help="Send the file to the API as-is, even if long")
 
-    parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        help="Output file path. If not specified, generates based on input filename",
-    )
+    api = parser.add_argument_group("API options")
+    api.add_argument("--env-file", type=Path, help="Path to .env file (default: ./.env)")
+    api.add_argument("--language", "-l", help="Language code (default: th)")
+    api.add_argument("--temperature", "-t", type=float, help="Sampling temperature 0.0-1.0 (default: 0.0)")
+    api.add_argument("--response-format", "-rf", choices=["json", "text", "srt", "verbose_json", "vtt"], help="API response format")
 
-    parser.add_argument(
-        "--output-format", "-of",
-        choices=["txt", "json", "both"],
-        default="txt",
-        help="Output format: txt, json, or both (default: txt)",
-    )
-
-    parser.add_argument(
-        "--output-dir", "-od",
-        type=Path,
-        help="Output directory. If not specified, uses same directory as input file",
-    )
-
-    # Pipeline options
-    parser.add_argument(
-        "--chunk-duration",
-        type=int,
-        default=None,
-        metavar="SECONDS",
-        help="Split audio into chunks of this duration (default: 300s for pipeline, disabled for short files)",
-    )
-
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume an interrupted pipeline run (reuse already-transcribed chunks)",
-    )
-
-    parser.add_argument(
-        "--no-pipeline",
-        action="store_true",
-        help="Force single-file transcription (skip chunked pipeline even for long files)",
-    )
-
-    parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=3,
-        metavar="N",
-        help="Number of parallel transcription workers (default: 3, use 1 for sequential)",
-    )
-
-    # Existing options
-    parser.add_argument(
-        "--env-file",
-        type=Path,
-        help="Path to .env file (default: .env in current directory)",
-    )
-
-    parser.add_argument(
-        "--language", "-l",
-        help="Language code (default: th for Thai)",
-    )
-
-    parser.add_argument(
-        "--temperature", "-t",
-        type=float,
-        help="Sampling temperature 0.0-1.0 (default: 0.0 for deterministic output)",
-    )
-
-    parser.add_argument(
-        "--response-format", "-rf",
-        choices=["json", "text", "srt", "verbose_json", "vtt"],
-        help="API response format (default: from config)",
-    )
-
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: from config or INFO)",
-    )
-
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress output summary (only save to file)",
-    )
-
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level (default: WARNING, or TYPHOON_LOG_LEVEL)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
     return parser.parse_args()
 
 
 def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient) -> int:
-    """Run the chunked transcription pipeline for long/convertible files."""
-    from src.pipeline import TranscriptionPipeline
-
-    chunk_duration = args.chunk_duration if args.chunk_duration else 300
-
     pipeline = TranscriptionPipeline(
         client=client,
-        chunk_duration=chunk_duration,
+        chunk_duration=args.chunk_duration or DEFAULT_CHUNK_DURATION,
         max_workers=args.workers,
+        smart_split=not args.fixed_chunks,
     )
-
     try:
-        pipeline.run(
+        result = pipeline.run(
             input_path=args.file,
             output_path=args.output,
             output_format=args.output_format,
@@ -226,134 +109,78 @@ def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: Ty
             response_format=config.response_format,
             quiet=args.quiet,
         )
-        return 0
     except KeyboardInterrupt:
-        print("\n\nInterrupted. Run with --resume to continue where you left off.")
-        return 130
+        print("\n\nInterrupted. Run again with --resume to continue where you left off.", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(EXIT_INTERRUPTED)  # don't wait for in-flight uploads to finish
     except Exception as e:
-        logging.getLogger(__name__).error(f"Pipeline failed: {e}")
-        return 1
+        logging.getLogger(__name__).error(f"Pipeline failed: {describe_error(e)}")
+        return EXIT_ERROR
+    return EXIT_PARTIAL if result.get("failed_chunks") else EXIT_OK
 
 
 def run_direct(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient) -> int:
-    """Run direct single-file transcription (original behavior)."""
     logger = logging.getLogger(__name__)
-
     try:
-        logger.info("Starting transcription...")
         result = client.transcribe(
             audio_file_path=args.file,
             language=config.language,
             temperature=config.temperature,
             response_format=config.response_format,
         )
-        logger.info("Transcription completed successfully")
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
-        return 1
+        logger.error(f"Transcription failed: {describe_error(e)}")
+        return EXIT_ERROR
 
-    # Display results (unless quiet mode)
     if not args.quiet:
         print("\n" + format_transcription_summary(result))
-
-    # Save output
     try:
-        if args.output:
-            output_path = args.output
-            if args.output_format == "json" or (args.output_format == "both"):
-                save_json_output(result, output_path)
-            else:
-                save_text_output(result["text"], output_path)
-        else:
-            if args.output_format == "txt":
-                output_path = generate_output_path(args.file, "txt", output_dir=args.output_dir)
-                save_text_output(result["text"], output_path)
-                print(f"\n Saved to: {output_path}")
-            elif args.output_format == "json":
-                output_path = generate_output_path(args.file, "json", output_dir=args.output_dir)
-                save_json_output(result, output_path)
-                print(f"\n Saved to: {output_path}")
-            elif args.output_format == "both":
-                txt_path = generate_output_path(args.file, "txt", output_dir=args.output_dir)
-                json_path = generate_output_path(args.file, "json", output_dir=args.output_dir)
-                save_text_output(result["text"], txt_path)
-                save_json_output(result, json_path)
-                print(f"\n Saved to: {txt_path}")
-                print(f" Saved to: {json_path}")
-    except Exception as e:
+        for path in save_outputs(result, args.file, args.output_format, output_path=args.output, output_dir=args.output_dir):
+            print(f"Saved: {path}")
+    except OSError as e:
         logger.error(f"Failed to save output: {e}")
-        return 1
-
-    logger.info("Transcription process completed successfully")
-    return 0
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def main() -> int:
-    """Main entry point for the transcriber CLI."""
     args = parse_arguments()
-
     if args.workers < 1:
         print("Error: --workers must be at least 1", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
+    if args.chunk_duration is not None and args.chunk_duration <= 0:
+        print("Error: --chunk-duration must be positive", file=sys.stderr)
+        return EXIT_ERROR
 
-    # Load environment variables from .env file
     load_env_file(args.env_file)
-
-    # Load configuration
     try:
         config = TranscriberConfig.from_env()
+        if args.language:
+            config.language = args.language
+        if args.temperature is not None:
+            config.temperature = args.temperature
+        if args.response_format:
+            config.response_format = args.response_format
         config.validate()
     except ValueError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
-        print("\nMake sure to set TYPHOON_API_KEY in your .env file or environment.", file=sys.stderr)
-        print("Get your API key from: https://playground.opentyphoon.ai/asr", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
 
-    # Override config with CLI arguments if provided
-    if args.log_level:
-        config.log_level = args.log_level
-    if args.language:
-        config.language = args.language
-    if args.temperature is not None:
-        config.temperature = args.temperature
-    if args.response_format:
-        config.response_format = args.response_format
-
-    # Setup logging
-    setup_logging(config.log_level)
+    log_level = args.log_level or os.getenv("TYPHOON_LOG_LEVEL", "WARNING")
+    logging.basicConfig(level=log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
     logger = logging.getLogger(__name__)
 
-    # Validate input file
     try:
         validate_audio_file(args.file)
     except (FileNotFoundError, ValueError) as e:
-        logger.error(f"Invalid audio file: {e}")
-        return 1
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    logger.info(f"Input: {args.file} ({format_file_size(args.file.stat().st_size)})")
 
-    file_size = args.file.stat().st_size
-    logger.info(f"Input file: {args.file}")
-    logger.info(f"File size: {format_file_size(file_size)}")
-
-    # Initialize client
-    try:
-        client = TyphoonASRClient(config)
-    except Exception as e:
-        logger.error(f"Failed to initialize client: {e}")
-        return 1
-
-    # Decide: pipeline or direct transcription
-    if args.no_pipeline:
-        use_pipeline = False
-    else:
-        from src.pipeline import should_use_pipeline
-        use_pipeline = should_use_pipeline(args.file, args.chunk_duration)
-
-    if use_pipeline:
-        logger.info("Using chunked pipeline mode")
+    client = TyphoonASRClient(config)
+    if not args.no_pipeline and should_use_pipeline(args.file, args.chunk_duration):
         return run_pipeline(args, config, client)
-    else:
-        logger.info("Using direct transcription mode")
-        return run_direct(args, config, client)
+    return run_direct(args, config, client)
 
 
 if __name__ == "__main__":
