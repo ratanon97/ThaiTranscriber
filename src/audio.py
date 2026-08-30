@@ -71,18 +71,18 @@ def split_audio(
     input_path: Path,
     output_dir: Path,
     chunk_duration: int = 300,
-    bitrate: str = "48k",
     sample_rate: int = 16000,
 ) -> List[Path]:
-    """Split audio into chunks, converting to speech-optimized opus format.
+    """Split audio into chunks, converting to speech-optimized wav format.
 
     Single ffmpeg pass: converts, downsamples, encodes, and splits.
+    Wav is used instead of opus because the Typhoon API intermittently
+    rejects specific opus payloads with 500 errors; wav has been reliable.
 
     Args:
         input_path: Path to the input audio file (any supported format)
         output_dir: Directory to write chunk files into
         chunk_duration: Duration of each chunk in seconds (default: 300 = 5 min)
-        bitrate: Opus bitrate (default: 48k, good for speech)
         sample_rate: Sample rate in Hz (default: 16000, optimal for ASR)
 
     Returns:
@@ -92,15 +92,14 @@ def split_audio(
         RuntimeError: If ffmpeg fails
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = str(output_dir / "chunk_%03d.opus")
+    pattern = str(output_dir / "chunk_%03d.wav")
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
         "-ac", "1",                    # mono
         "-ar", str(sample_rate),       # 16kHz
-        "-c:a", "libopus",             # opus codec
-        "-b:a", bitrate,               # 48kbps
+        "-c:a", "pcm_s16le",           # 16-bit PCM wav
         "-f", "segment",               # segment demuxer
         "-segment_time", str(chunk_duration),
         "-reset_timestamps", "1",      # clean timestamps per chunk
@@ -113,7 +112,7 @@ def split_audio(
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg split failed: {result.stderr[-500:]}")
 
-    chunks = sorted(output_dir.glob("chunk_*.opus"))
+    chunks = sorted(output_dir.glob("chunk_*.wav"))
     if not chunks:
         raise RuntimeError("ffmpeg produced no output chunks")
 
@@ -121,20 +120,18 @@ def split_audio(
     return chunks
 
 
-def convert_to_opus(
+def convert_to_wav(
     input_path: Path,
     output_path: Path,
-    bitrate: str = "48k",
     sample_rate: int = 16000,
 ) -> Path:
-    """Convert a single audio file to speech-optimized opus.
+    """Convert a single audio file to speech-optimized wav.
 
     Used for short files that don't need splitting but need format conversion.
 
     Args:
         input_path: Source audio file
-        output_path: Destination opus file
-        bitrate: Opus bitrate
+        output_path: Destination wav file
         sample_rate: Sample rate in Hz
 
     Returns:
@@ -150,8 +147,7 @@ def convert_to_opus(
         "-i", str(input_path),
         "-ac", "1",
         "-ar", str(sample_rate),
-        "-c:a", "libopus",
-        "-b:a", bitrate,
+        "-c:a", "pcm_s16le",
         str(output_path),
     ]
 

@@ -40,7 +40,7 @@ The tool now supports m4a directly via automatic pipeline mode. No manual ffmpeg
 ```
 
 For long recordings (1-2 hours), the pipeline automatically:
-1. Converts m4a to speech-optimized opus (mono, 16kHz, 48kbps)
+1. Converts m4a to speech-optimized wav (mono, 16kHz, 16-bit PCM)
 2. Splits into 5-minute chunks (configurable via `--chunk-duration`)
 3. Transcribes chunks in parallel (3 workers by default, configurable via `--workers`)
 4. Merges all results into a single JSON
@@ -120,7 +120,7 @@ Follow the established format in existing summaries. Example:
 
 - **Always use the venv**: `transcribe.py` enforces virtual environment usage and will refuse to run under system Python
 - **Never commit .env**: it contains the Typhoon API key
-- **m4a is now supported**: the pipeline auto-converts m4a to opus before transcription. No manual ffmpeg step needed.
+- **m4a is now supported**: the pipeline auto-converts m4a to wav before transcription. No manual ffmpeg step needed. (Chunks were previously opus, but the Typhoon API intermittently rejected specific opus payloads with 500 errors; wav has been reliable.)
 - **5-minute chunks are optimal**: for long files, the default 300s chunk duration balances API timeout risk (~35s processing per chunk) against number of API calls. Use 180s if experiencing frequent 524 timeouts. With 3 parallel workers (default), a 1-hour file processes in ~3-4 minutes instead of ~12 minutes sequential.
 - **Speaker attribution is approximate**: ASR output is a single text blob without speaker diarization. Claude infers speakers from context, names mentioned, and conversational patterns. Mark attribution as approximate.
 - **Thai ASR quality**: Typhoon ASR handles Thai well but informal speech, slang, and code-switching (Thai-English) can produce imperfect transcriptions. Claude should interpret the intent rather than translating ASR artifacts literally.

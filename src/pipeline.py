@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from .audio import (
     check_ffmpeg,
-    convert_to_opus,
+    convert_to_wav,
     format_duration,
     needs_conversion,
     probe_duration,
@@ -251,7 +251,7 @@ class TranscriptionPipeline:
 
     def _split(self, input_path: Path, work_dir: Path, quiet: bool) -> List[Path]:
         """Split audio into chunks. Reuses existing chunks if present."""
-        existing_chunks = sorted(work_dir.glob("chunk_*.opus"))
+        existing_chunks = sorted(work_dir.glob("chunk_*.wav"))
         if existing_chunks:
             if not quiet:
                 print(f"Reusing {len(existing_chunks)} existing chunks from previous run")
