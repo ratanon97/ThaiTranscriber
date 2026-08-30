@@ -13,6 +13,7 @@ import openai
 from openai import OpenAI
 
 from .config import TranscriberConfig
+from .utils import normalize_thai
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +68,9 @@ def response_to_dict(response: Any) -> Dict[str, Any]:
     in the audio.
     """
     if isinstance(response, str):
-        return {"text": response}
+        return {"text": normalize_thai(response)}
     data = response.model_dump() if hasattr(response, "model_dump") else {}
-    result: Dict[str, Any] = {"text": data.get("text") or getattr(response, "text", "") or ""}
+    result: Dict[str, Any] = {"text": normalize_thai(data.get("text") or getattr(response, "text", "") or "")}
     for key in ("language", "duration", "segments", "words"):
         if data.get(key) is not None:
             result[key] = data[key]

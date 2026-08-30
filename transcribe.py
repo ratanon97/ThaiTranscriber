@@ -34,9 +34,11 @@ import argparse
 import logging
 import os
 from pathlib import Path
+from typing import Optional
 
 from src.client import TyphoonASRClient, describe_error
 from src.config import TranscriberConfig, load_env_file
+from src.correct import DEFAULT_GLOSSARY_PATH, TranscriptCorrector, load_glossary
 from src.pipeline import DEFAULT_CHUNK_DURATION, DEFAULT_WORKERS, TranscriptionPipeline, should_use_pipeline
 from src.utils import format_file_size, format_transcription_summary, save_outputs, validate_audio_file
 
@@ -55,6 +57,11 @@ Pipeline mode:
   A chunk that keeps failing does not stop the others: the output is written
   with that span marked missing, the exit code is 2, and --resume retries it.
 
+Correction:
+  Each chunk's raw ASR text is passed through a Thai LLM with your glossary to
+  fix misheard words and names. The raw text is kept as `text_raw`. Disable
+  with --no-correct.
+
 Environment variables (or .env):
   TYPHOON_API_KEY          Your Typhoon API key (required)
   TYPHOON_BASE_URL         API base URL (optional)
@@ -62,7 +69,8 @@ Environment variables (or .env):
   TYPHOON_LANGUAGE         Language code (default: th)
   TYPHOON_RESPONSE_FORMAT  Response format (default: json)
   TYPHOON_TEMPERATURE      Temperature (default: 0.0)
-  TYPHOON_LOG_LEVEL        Logging level (default: INFO)
+  TYPHOON_LOG_LEVEL        Logging level (default: WARNING)
+  TYPHOON_CORRECTION_MODEL LLM for post-correction (default: typhoon-v2.5-30b-a3b-instruct)
 
 Get your API key from: https://playground.opentyphoon.ai/asr
         """,
@@ -79,6 +87,10 @@ Get your API key from: https://playground.opentyphoon.ai/asr
     pipeline.add_argument("--fixed-chunks", action="store_true", help="Cut at exact intervals instead of at nearby pauses")
     pipeline.add_argument("--no-pipeline", action="store_true", help="Send the file to the API as-is, even if long")
 
+    correction = parser.add_argument_group("correction options")
+    correction.add_argument("--no-correct", action="store_true", help="Skip the LLM post-correction pass (keep raw ASR text)")
+    correction.add_argument("--glossary", type=Path, help=f"Glossary file of names/terms for correction (default: ./{DEFAULT_GLOSSARY_PATH} if present)")
+
     api = parser.add_argument_group("API options")
     api.add_argument("--env-file", type=Path, help="Path to .env file (default: ./.env)")
     api.add_argument("--language", "-l", help="Language code (default: th)")
@@ -90,12 +102,22 @@ Get your API key from: https://playground.opentyphoon.ai/asr
     return parser.parse_args()
 
 
-def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient) -> int:
+def build_corrector(args: argparse.Namespace, config: TranscriberConfig) -> Optional[TranscriptCorrector]:
+    if args.no_correct:
+        return None
+    glossary = load_glossary(args.glossary)
+    if not glossary and not args.quiet:
+        print(f"Note: no glossary found at {DEFAULT_GLOSSARY_PATH}; correction runs without name hints")
+    return TranscriptCorrector(config, glossary=glossary)
+
+
+def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient, corrector: Optional[TranscriptCorrector]) -> int:
     pipeline = TranscriptionPipeline(
         client=client,
         chunk_duration=args.chunk_duration or DEFAULT_CHUNK_DURATION,
         max_workers=args.workers,
         smart_split=not args.fixed_chunks,
+        post_processor=corrector,
     )
     try:
         result = pipeline.run(
@@ -119,7 +141,7 @@ def run_pipeline(args: argparse.Namespace, config: TranscriberConfig, client: Ty
     return EXIT_PARTIAL if result.get("failed_chunks") else EXIT_OK
 
 
-def run_direct(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient) -> int:
+def run_direct(args: argparse.Namespace, config: TranscriberConfig, client: TyphoonASRClient, corrector: Optional[TranscriptCorrector]) -> int:
     logger = logging.getLogger(__name__)
     try:
         result = client.transcribe(
@@ -128,6 +150,8 @@ def run_direct(args: argparse.Namespace, config: TranscriberConfig, client: Typh
             temperature=config.temperature,
             response_format=config.response_format,
         )
+        if corrector is not None:
+            result = corrector(result)
     except Exception as e:
         logger.error(f"Transcription failed: {describe_error(e)}")
         return EXIT_ERROR
@@ -178,9 +202,14 @@ def main() -> int:
     logger.info(f"Input: {args.file} ({format_file_size(args.file.stat().st_size)})")
 
     client = TyphoonASRClient(config)
+    try:
+        corrector = build_corrector(args, config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_ERROR
     if not args.no_pipeline and should_use_pipeline(args.file, args.chunk_duration):
-        return run_pipeline(args, config, client)
-    return run_direct(args, config, client)
+        return run_pipeline(args, config, client, corrector)
+    return run_direct(args, config, client, corrector)
 
 
 if __name__ == "__main__":

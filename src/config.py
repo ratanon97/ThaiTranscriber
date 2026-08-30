@@ -21,6 +21,8 @@ class TranscriberConfig:
     response_format: str = "json"
     temperature: float = 0.0  # 0 = deterministic output
     log_level: str = "INFO"
+    # Thai LLM used for post-correction of ASR text
+    correction_model: str = "typhoon-v2.5-30b-a3b-instruct"
 
     @classmethod
     def from_env(cls) -> "TranscriberConfig":
@@ -43,6 +45,7 @@ class TranscriberConfig:
             response_format=os.getenv("TYPHOON_RESPONSE_FORMAT", cls.response_format),
             temperature=float(os.getenv("TYPHOON_TEMPERATURE", cls.temperature)),
             log_level=os.getenv("TYPHOON_LOG_LEVEL", cls.log_level),
+            correction_model=os.getenv("TYPHOON_CORRECTION_MODEL", cls.correction_model),
         )
 
     def validate(self) -> None:

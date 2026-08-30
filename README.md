@@ -1,288 +1,114 @@
 # ThaiTranscriber
 
-A minimal Python CLI tool for transcribing Thai audio files using the Typhoon ASR API.
+CLI tool that transcribes Thai audio (phone recordings, meetings, 1-2 hour conversations) with the Typhoon ASR API, then cleans the text up with a Thai LLM so it is ready to summarize and translate.
 
-## Features
+## What it does
 
-- CLI interface for transcribing Thai audio files
-- Support for multiple audio formats (.wav, .mp3, .flac, .ogg, .opus)
-- Configurable output formats (plain text or JSON with metadata)
-- Environment-based configuration
-- Comprehensive error handling and logging
-- Optimized for Thai language transcription
+1. Converts any input (m4a, mp3, wav, ...) to 16 kHz mono wav with ffmpeg
+2. Cuts it into ~5-minute chunks **at natural pauses**, not mid-word
+3. Transcribes chunks **in parallel** (6 workers) with retry on transient API errors
+4. Passes each chunk through a Thai LLM (`typhoon-v2.5-30b`) with your **glossary** of names and terms to fix misheard words; raw text is kept alongside
+5. Merges everything into one JSON with **per-chunk timestamps**, plus an optional timestamped `.txt`
+
+A 1-hour recording takes roughly 2 minutes; a 2-hour recording roughly 4 minutes.
 
 ## Requirements
 
-- Python 3.11 or higher
-- Typhoon ASR API key (get from https://playground.opentyphoon.ai/asr)
+- Python 3.11+
+- ffmpeg and ffprobe on PATH (`brew install ffmpeg`)
+- Typhoon API key from https://playground.opentyphoon.ai/asr
 
-## Installation
+## Setup
 
-1. Clone or download this repository:
-```bash
-git clone <repository-url>
-cd ThaiTranscriber
-```
-
-2. Create and activate a virtual environment:
 ```bash
 python3 -m venv venv
-source venv/bin/activate
+./venv/bin/pip install -r requirements.txt
+cp .env.example .env            # add TYPHOON_API_KEY
+cp glossary.example.md glossary.md   # names, places, terms for correction (optional, gitignored)
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Configure your API key:
-```bash
-# Copy the example environment file
-cp .env.example .env
-
-# Edit .env and add your Typhoon ASR API key
-# Get your API key from: https://playground.opentyphoon.ai/asr
-```
+`transcribe.py` refuses to run outside the venv, so call it as `./venv/bin/python transcribe.py`.
 
 ## Usage
 
-**Important:** Always activate the virtual environment before running the script:
 ```bash
-source venv/bin/activate
+# Typical: any file, JSON + txt into transcriptions/
+./venv/bin/python transcribe.py --file "Meeting.m4a" --output-format both --output-dir ./transcriptions/
+
+# Interrupted or some chunks failed (exit code 2)? Retry only what is missing
+./venv/bin/python transcribe.py --file "Meeting.m4a" --output-format both --output-dir ./transcriptions/ --resume
+
+# Raw ASR text only, no LLM correction
+./venv/bin/python transcribe.py --file "Meeting.m4a" --no-correct ...
+
+# Tuning
+--chunk-duration 180   # shorter chunks (default 300 s)
+--workers 8            # more parallelism (API limit is 100 req/min; 8 is safe)
+--fixed-chunks         # cut at exact intervals instead of pauses
+--no-pipeline          # send a short API-compatible file directly
+--glossary path.md     # glossary other than ./glossary.md
 ```
 
-Or run directly with the venv Python:
-```bash
-./venv/bin/python transcribe.py --file audio.wav
-```
+Exit codes: `0` success, `1` error, `2` partial (see `failed_chunks` in the JSON; use `--resume`), `130` interrupted.
 
-### Basic Transcription
+## Output
 
-Transcribe an audio file to text:
-```bash
-python transcribe.py --file audio.wav
-```
+`transcriptions/<name>.json`:
 
-Transcription JSON output goes to `transcriptions/` and summaries to `summaries/`.
-
-### JSON Output with Metadata
-
-Save transcription with metadata in JSON format:
-```bash
-python transcribe.py --file audio.mp3 --output-format json
-```
-
-### Save Both Formats
-
-Generate both text and JSON outputs:
-```bash
-python transcribe.py --file audio.wav --output-format both
-```
-
-### Custom Output Path
-
-Specify a custom output file:
-```bash
-python transcribe.py --file audio.wav --output transcript.txt
-```
-
-### Custom Output Directory
-
-Save to a specific directory:
-```bash
-python transcribe.py --file audio.wav --output-dir ./transcriptions/
-```
-
-### Advanced Options
-
-```bash
-# Use a custom .env file
-python transcribe.py --file audio.wav --env-file production.env
-
-# Override language setting
-python transcribe.py --file audio.wav --language th
-
-# Adjust temperature for sampling
-python transcribe.py --file audio.wav --temperature 0.0
-
-# Enable debug logging
-python transcribe.py --file audio.wav --log-level DEBUG
-
-# Quiet mode (no console output)
-python transcribe.py --file audio.wav --quiet
-```
-
-## Configuration
-
-### Environment Variables
-
-Create a `.env` file in the project directory with the following variables:
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `TYPHOON_API_KEY` | Yes | - | Your Typhoon ASR API key |
-| `TYPHOON_BASE_URL` | No | `https://api.opentyphoon.ai/v1` | API endpoint |
-| `TYPHOON_MODEL` | No | `typhoon-asr-realtime` | Model name |
-| `TYPHOON_LANGUAGE` | No | `th` | Language code (Thai) |
-| `TYPHOON_RESPONSE_FORMAT` | No | `json` | API response format |
-| `TYPHOON_TEMPERATURE` | No | `0.0` | Sampling temperature (0.0-1.0) |
-| `TYPHOON_ENABLE_TIMESTAMPS` | No | `true` | Enable word-level timestamps |
-| `TYPHOON_ENABLE_WORD_CONFIDENCE` | No | `true` | Enable confidence scores |
-| `TYPHOON_LOG_LEVEL` | No | `INFO` | Logging level |
-
-### Command-Line Arguments
-
-All configuration can be overridden via command-line arguments:
-
-```bash
-python transcribe.py --help
-```
-
-## Project Structure
-
-```
-ThaiTranscriber/
-├── transcribe.py          # Main CLI entry point (requires venv)
-├── src/
-│   ├── __init__.py       # Package initialization
-│   ├── client.py         # Typhoon ASR API client wrapper
-│   ├── config.py         # Configuration management
-│   └── utils.py          # Utility functions
-├── transcriptions/       # JSON transcription outputs (gitignored)
-├── summaries/            # Summary and translation documents (gitignored)
-├── venv/                 # Python virtual environment (gitignored)
-├── requirements.txt      # Python dependencies
-├── .env.example         # Environment configuration template
-├── .gitignore           # Git ignore rules
-└── README.md            # This file
-```
-
-## Supported Audio Formats
-
-- WAV (.wav)
-- MP3 (.mp3)
-- FLAC (.flac)
-- OGG (.ogg)
-- OPUS (.opus)
-
-## Output Formats
-
-### Text Format (.txt)
-
-Plain text transcription:
-```
-สวัสดีครับ ยินดีต้อนรับ
-```
-
-### JSON Format (.json)
-
-Transcription with metadata:
 ```json
 {
-  "text": "สวัสดีครับ ยินดีต้อนรับ",
-  "language": "th",
-  "duration": 2.5
+  "text": "corrected full transcript",
+  "text_raw": "raw ASR transcript",
+  "source": "Meeting.m4a",
+  "duration_seconds": 3612.4,
+  "duration_formatted": "1h 00m 12s",
+  "chunks": 12,
+  "chunk_duration_seconds": 300,
+  "pipeline": true,
+  "failed_chunks": [],
+  "segments": [
+    {"index": 0, "start": 0.0, "end": 297.4, "start_formatted": "00:00", "end_formatted": "04:57",
+     "text": "...", "text_raw": "..."}
+  ]
 }
 ```
 
-## Error Handling
+A chunk that could not be transcribed appears in `text` as `[[missing 25:00-30:00: transcription failed]]` and in `failed_chunks`.
 
-The tool provides clear error messages for common issues:
+## Configuration (`.env`)
 
-- **Missing API Key**: Prompts to configure `TYPHOON_API_KEY`
-- **Authentication Errors**: Validates API key
-- **Rate Limits**: Informs about API rate limits (100 requests/minute)
-- **Invalid Audio Format**: Lists supported formats
-- **File Not Found**: Validates file paths
-- **Network Errors**: Reports timeout and connection issues
+| Variable | Default | Purpose |
+|---|---|---|
+| `TYPHOON_API_KEY` | required | API key |
+| `TYPHOON_BASE_URL` | `https://api.opentyphoon.ai/v1` | API endpoint |
+| `TYPHOON_MODEL` | `typhoon-asr-realtime` | ASR model |
+| `TYPHOON_CORRECTION_MODEL` | `typhoon-v2.5-30b-a3b-instruct` | LLM for post-correction |
+| `TYPHOON_LANGUAGE` | `th` | Language code |
+| `TYPHOON_TEMPERATURE` | `0.0` | ASR sampling temperature |
+| `TYPHOON_RESPONSE_FORMAT` | `json` | ASR response format |
+| `TYPHOON_LOG_LEVEL` | `WARNING` | Logging level |
 
-## Logging
+## Development
 
-Logging is configured to show:
-- Timestamp
-- Module name
-- Log level
-- Message
-
-Available log levels:
-- `DEBUG`: Detailed diagnostic information
-- `INFO`: General information (default)
-- `WARNING`: Warning messages
-- `ERROR`: Error messages
-
-Set via environment variable or command-line:
 ```bash
-python transcribe.py --file audio.wav --log-level DEBUG
+./venv/bin/python -m pytest -q
 ```
 
-## API Information
+Tests cover split planning, retry policy, merging, resume, partial failure, output saving, and the correction guardrails; the ffmpeg-backed tests generate their own tone files and skip if ffmpeg is missing.
 
-- **Provider**: OpenTyphoon AI
-- **Endpoint**: https://api.opentyphoon.ai/v1
-- **Model**: typhoon-asr-realtime
-- **Rate Limit**: 100 requests per minute
-- **Documentation**: https://docs.opentyphoon.ai/th/asr/
+## Project layout
 
-### Getting an API Key
-
-1. Visit https://playground.opentyphoon.ai/asr
-2. Sign up or log in
-3. Generate an API key
-4. Add it to your `.env` file
-
-## Best Practices
-
-### For Best Transcription Accuracy
-
-1. **Audio Quality**: Use high-quality audio recordings
-2. **Format**: WAV or FLAC for best quality
-3. **Sample Rate**: 16kHz or higher recommended
-4. **Background Noise**: Minimize background noise
-5. **Temperature**: Keep at 0.0 for deterministic results
-
-### For Large Files
-
-- Check API documentation for file size limits
-- Consider splitting very long audio files
-- Use appropriate timeouts for large files
-
-## Troubleshooting
-
-### "pip not found"
-Use `pip3` instead:
-```bash
-pip3 install -r requirements.txt
+```
+transcribe.py        CLI entry point
+src/audio.py         ffmpeg: probe, convert + silence detection, pause-aware split
+src/client.py        Typhoon ASR client, error classification
+src/correct.py       LLM post-correction with glossary
+src/pipeline.py      chunk -> parallel transcribe -> merge, resume, partial failure
+src/config.py        .env / environment configuration
+src/utils.py         validation, output writing, Thai text normalization
+tests/               pytest suite
 ```
 
-### "TYPHOON_API_KEY environment variable is required"
-1. Verify `.env` file exists in project directory
-2. Check that `TYPHOON_API_KEY` is set in `.env`
-3. Ensure no typos in variable name
-4. Verify no extra spaces around the API key
+## Notes on the ASR model
 
-### "Authentication failed"
-1. Get a new API key from https://playground.opentyphoon.ai/asr
-2. Update your `.env` file
-3. Ensure the API key is copied correctly
-
-### "Rate limit exceeded"
-Wait 60 seconds before making more requests. The API allows 100 requests per minute.
-
-### "Invalid audio format"
-Ensure your audio file is in a supported format: .wav, .mp3, .flac, .ogg, or .opus
-
-## License
-
-This project is provided as-is for use with the Typhoon ASR API.
-
-## Credits
-
-- **Typhoon ASR API**: OpenTyphoon AI (https://opentyphoon.ai)
-- **OpenAI SDK**: Used for API communication
-
-## Support
-
-For issues related to:
-- **This tool**: Check the troubleshooting section above
-- **Typhoon ASR API**: Visit https://docs.opentyphoon.ai/th/asr/
-- **API access**: Contact OpenTyphoon AI support
+`typhoon-asr-realtime` is a 114M-parameter streaming model (~10% character error rate on Thai). It has no vocabulary prompt and returns no usable segment timestamps, which is why the tool derives timestamps from chunk boundaries and relies on the LLM pass plus glossary for names and loanwords.

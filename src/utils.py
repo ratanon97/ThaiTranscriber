@@ -10,6 +10,11 @@ from .audio import ALL_SUPPORTED_FORMATS
 logger = logging.getLogger(__name__)
 
 
+def normalize_thai(text: str) -> str:
+    """Normalize ASR artifacts: decomposed nikhahit + sara aa -> sara am (ทํา -> ทำ)."""
+    return text.replace("\u0e4d\u0e32", "\u0e33")
+
+
 def validate_audio_file(file_path: Path) -> None:
     """Raise if the path is not an existing file with a supported extension.
 

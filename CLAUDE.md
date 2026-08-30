@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-ThaiTranscriber is a CLI tool that transcribes Thai audio files using the Typhoon ASR API. Tap uses it as part of a multi-step workflow: record audio (usually m4a from a phone), transcribe it, then have Claude summarize the transcription in both Thai and English.
+ThaiTranscriber is a CLI tool that transcribes Thai audio files using the Typhoon ASR API and cleans the text with a Thai LLM. Tap uses it as part of a multi-step workflow: record audio (usually m4a from a phone), transcribe it, then have Claude summarize the transcription in both Thai and English.
 
 ## Project Structure
 
@@ -10,19 +10,19 @@ ThaiTranscriber is a CLI tool that transcribes Thai audio files using the Typhoo
 ThaiTranscriber/
 ├── transcribe.py              # CLI entry point (requires venv)
 ├── src/
-│   ├── __init__.py
-│   ├── client.py              # Typhoon ASR API client (OpenAI SDK)
+│   ├── client.py              # Typhoon ASR API client (OpenAI SDK), error classification
 │   ├── config.py              # Config from .env / environment vars
-│   ├── audio.py               # ffmpeg wrapper (convert, split, probe duration)
-│   ├── pipeline.py            # Chunked transcription pipeline orchestrator
-│   └── utils.py               # File validation, output helpers
+│   ├── audio.py               # ffmpeg: probe, convert + silence detection, pause-aware split
+│   ├── correct.py             # LLM post-correction of ASR text using the glossary
+│   ├── pipeline.py            # chunk -> parallel transcribe -> merge, resume, partial failure
+│   └── utils.py               # File validation, output writing, Thai normalization
+├── tests/                     # pytest suite (./venv/bin/python -m pytest -q)
+├── glossary.md                # Names/places/terms for correction (gitignored; see glossary.example.md)
 ├── transcriptions/            # JSON transcription outputs (gitignored)
 ├── summaries/                 # Summary and translation MDs (gitignored)
 ├── venv/                      # Python virtual environment (gitignored)
 ├── .env                       # API key config (gitignored, NEVER commit)
-├── .env.example               # Template for .env
-├── requirements.txt           # openai>=1.0.0
-└── IMPLEMENTATION_PLAN.md     # Original design doc
+└── requirements.txt           # openai, python-dotenv, pytest
 ```
 
 ## Typical Workflow
@@ -31,50 +31,33 @@ When Tap provides an m4a audio recording, follow these steps:
 
 ### Step 1: Transcribe the Audio
 
-The tool now supports m4a directly via automatic pipeline mode. No manual ffmpeg conversion needed.
-
 ```bash
-# Single command for any audio file (m4a, wav, mp3, etc.)
-# Pipeline auto-activates for files >10 min or m4a format
 ./venv/bin/python transcribe.py --file "Recording Name.m4a" --output-format json --output-dir ./transcriptions/
 ```
 
-For long recordings (1-2 hours), the pipeline automatically:
-1. Converts m4a to speech-optimized wav (mono, 16kHz, 16-bit PCM)
-2. Splits into 5-minute chunks (configurable via `--chunk-duration`)
-3. Transcribes chunks in parallel (3 workers by default, configurable via `--workers`)
-4. Merges all results into a single JSON
-5. Cleans up temporary files
+The pipeline activates automatically for m4a or files over 10 minutes. It:
+1. Converts to 16 kHz mono wav and detects pauses (one ffmpeg pass)
+2. Cuts into ~5-minute chunks at the nearest pause (`--chunk-duration` to change, `--fixed-chunks` to cut at exact times)
+3. Transcribes chunks in parallel (6 workers, `--workers` to change)
+4. Runs each chunk's text through `typhoon-v2.5-30b` with `glossary.md` to fix misheard names and words (`--no-correct` to skip)
+5. Merges into one JSON with `text` (corrected), `text_raw`, and `segments[]` with absolute timestamps
+6. Cleans up temporary files
 
-**Pipeline options:**
-```bash
-# Custom chunk size (e.g., 3 min for more reliability)
-./venv/bin/python transcribe.py --file "meeting.m4a" --chunk-duration 180 --output-format json --output-dir ./transcriptions/
+**Exit codes:** 0 success, 1 error, 2 partial, 130 interrupted.
 
-# More parallel workers for faster processing (default: 3, safe up to 8)
-./venv/bin/python transcribe.py --file "meeting.m4a" --workers 5 --output-format json --output-dir ./transcriptions/
+**If the exit code is 2** (some chunks failed after retries): the JSON is still written with `[[missing MM:SS-MM:SS: transcription failed]]` markers and `failed_chunks`, and the work dir `transcriptions/.work_<name>/` is kept. Re-run the same command with `--resume`; only the failed chunks are retried. Do not hand-merge chunks.
 
-# Sequential processing (like the old behavior)
-./venv/bin/python transcribe.py --file "meeting.m4a" --workers 1 --output-format json --output-dir ./transcriptions/
-
-# Resume an interrupted run (skips already-transcribed chunks)
-./venv/bin/python transcribe.py --file "meeting.m4a" --output-format json --output-dir ./transcriptions/ --resume
-
-# Force direct mode (skip pipeline, for short API-compatible files)
-./venv/bin/python transcribe.py --file "short_clip.wav" --no-pipeline --output-format json
-```
-
-This produces a JSON file in `transcriptions/` with the raw Thai text from Typhoon ASR.
+**Before transcribing, check `glossary.md`**: if the recording involves people or places not listed, add them (Thai spelling + English name). The glossary is sent to the correction LLM with every chunk.
 
 ### Step 2: Summarize and Translate
 
 After transcription, Claude should:
 
-1. Read the JSON transcription from `transcriptions/`
+1. Read the JSON transcription from `transcriptions/`. Use `text` (corrected) as the primary source and `segments[]` for timestamps; consult `text_raw` if a corrected passage looks wrong.
 2. Create a summary markdown file in `summaries/` with this structure:
    - **Header**: file name, duration, language, date
-   - **English Summary**: key points, context, speaker attribution if multiple speakers
-   - **Original Thai Transcription**: the raw Thai text for reference
+   - **English Summary**: key points, context, speaker attribution if multiple speakers, with `[MM:SS]` references where useful
+   - **Original Thai Transcription**: the corrected Thai text for reference
 3. If there are multiple related recordings, combine them into a single summary document
 4. For longer or conversation-heavy recordings, also produce an English translation document with speaker tags `[T]` for Tap, `[Y]` for Somying, etc.
 
@@ -85,7 +68,7 @@ After transcription and summary are complete:
 - Delete the source m4a file (the original recording -- large, no longer needed)
 - Keep the JSON transcription in `transcriptions/` (small, useful reference)
 - Keep the summary/translation MDs in `summaries/` (the final deliverable)
-- No intermediate files to clean up (pipeline handles this automatically)
+- If a `.work_*` directory is left in `transcriptions/`, the run was partial; resolve it with `--resume` before deleting the source audio
 
 ## Summary Output Format
 
@@ -109,7 +92,7 @@ Follow the established format in existing summaries. Example:
 
 ## Original Thai Transcription
 
-[Raw Thai text from the JSON transcription]
+[Corrected Thai text from the JSON transcription]
 
 ---
 
@@ -119,19 +102,20 @@ Follow the established format in existing summaries. Example:
 ## Important Rules
 
 - **Always use the venv**: `transcribe.py` enforces virtual environment usage and will refuse to run under system Python
-- **Never commit .env**: it contains the Typhoon API key
-- **m4a is now supported**: the pipeline auto-converts m4a to wav before transcription. No manual ffmpeg step needed. (Chunks were previously opus, but the Typhoon API intermittently rejected specific opus payloads with 500 errors; wav has been reliable.)
-- **5-minute chunks are optimal**: for long files, the default 300s chunk duration balances API timeout risk (~35s processing per chunk) against number of API calls. Use 180s if experiencing frequent 524 timeouts. With 3 parallel workers (default), a 1-hour file processes in ~3-4 minutes instead of ~12 minutes sequential.
-- **Speaker attribution is approximate**: ASR output is a single text blob without speaker diarization. Claude infers speakers from context, names mentioned, and conversational patterns. Mark attribution as approximate.
-- **Thai ASR quality**: Typhoon ASR handles Thai well but informal speech, slang, and code-switching (Thai-English) can produce imperfect transcriptions. Claude should interpret the intent rather than translating ASR artifacts literally.
+- **Never commit .env or glossary.md**: `.env` contains the API key; `glossary.md` contains personal names. `glossary.example.md` is the committed template.
+- **Run the tests after changing src/**: `./venv/bin/python -m pytest -q` (ffmpeg-backed tests generate their own audio)
+- **Chunks are wav**: opus chunks were intermittently rejected by the API with 500s; wav has been reliable.
+- **Chunk boundaries fall on pauses**: `plan_cut_points` in `src/audio.py` looks for a silence within 10% of the target length. Timestamps in `segments[]` come from the real chunk durations.
+- **Speaker attribution is approximate**: ASR output has no speaker diarization. Claude infers speakers from context, names mentioned, and conversational patterns. Mark attribution as approximate.
+- **Thai ASR quality**: the ASR model is small (~10% character error rate); the LLM pass fixes clear errors and names but not everything. Interpret intent rather than translating artifacts literally.
 - **File naming**: JSON files keep the original recording name. Summary MDs use underscored names with `_Summary.md` suffix.
 
 ## API Details
 
 - **Provider**: OpenTyphoon AI (https://opentyphoon.ai)
-- **Model**: typhoon-asr-realtime
-- **Rate limit**: 100 requests/minute
-- **Endpoint**: https://api.opentyphoon.ai/v1
-- **SDK**: Uses the OpenAI Python SDK (API is OpenAI-compatible)
-- **Client timeout**: read=120s (to avoid premature timeout before Cloudflare's 524 gateway timeout)
-- **Pipeline retry**: exponential backoff (5s, 10s, 20s) on failure, max 3 retries per chunk
+- **ASR model**: typhoon-asr-realtime (114M-parameter streaming model; no prompt parameter; `verbose_json` returns no usable segments, so the tool derives timestamps from chunk boundaries)
+- **Correction model**: typhoon-v2.5-30b-a3b-instruct (128K context, 200 req/min), temperature 0, output rejected and raw text kept if it is truncated or its length is implausible
+- **ASR rate limit**: 100 requests/minute
+- **Endpoint**: https://api.opentyphoon.ai/v1 (OpenAI-compatible, via the OpenAI Python SDK)
+- **Timeouts**: ASR read timeout 120s; correction read timeout 180s
+- **Retries**: pipeline-owned (SDK retries disabled). Transient errors only (connection, timeout, 408/409/429/5xx), backoff 5s/10s/20s, max 3 retries per chunk

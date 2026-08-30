@@ -56,3 +56,6 @@ summaries/
 
 # Test / tool caches
 .pytest_cache/
+
+# Personal glossary (names of people/places); commit glossary.example.md instead
+glossary.md
