@@ -59,7 +59,7 @@ After transcription, Claude should:
    - **English Summary**: key points, context, speaker attribution if multiple speakers, with `[MM:SS]` references where useful
    - **Original Thai Transcription**: the corrected Thai text for reference
 3. If there are multiple related recordings, combine them into a single summary document
-4. For longer or conversation-heavy recordings, also produce an English translation document with speaker tags `[T]` for Tap, `[Y]` for Somying, etc.
+4. For longer or conversation-heavy recordings, also produce an English translation document with speaker tags: `[T]` for Tap and a one-letter tag for each other speaker (e.g., `[S]` for Somying).
 
 ### Step 3: Clean Up
 
